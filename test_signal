@@ -1,0 +1,131 @@
+import pandas as pd
+import numpy as np
+import requests
+import json
+from ta.trend import EMAIndicator
+from ta.volatility import AverageTrueRange
+from ta.trend import SuperTrend
+from binance.client import Client
+from binance.websockets import BinanceSocketManager
+from binance.enums import *
+
+# =========================
+# Telegram Bot Setup
+# =========================
+# Replace with your Telegram Bot Token and Chat ID
+TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
+TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
+
+# Function to send a message to your Telegram
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    params = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    response = requests.get(url, params=params)
+    return response.json()
+
+# =========================
+# Signal Logic (EMA and Supertrend)
+# =========================
+def check_signal(df):
+    # EMA Calculation
+    df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
+    df['ema21'] = EMAIndicator(df['close'], window=21).ema_indicator()
+    df['ema50'] = EMAIndicator(df['close'], window=50).ema_indicator()
+
+    # Check for Buy or Sell Signal
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    # Buy condition: 9 EMA crosses above 21 EMA, and 21 EMA crosses above 50 EMA, and Supertrend is green
+    if latest['ema9'] > latest['ema21'] > latest['ema50'] and latest['supertrend_direction'] == 'green' and prev['ema9'] < prev['ema21']:
+        return "buy"
+
+    # Sell condition: 9 EMA crosses below 21 EMA, and 21 EMA crosses below 50 EMA, and Supertrend is green
+    elif latest['ema9'] < latest['ema21'] < latest['ema50'] and latest['supertrend_direction'] == 'green' and prev['ema9'] > prev['ema21']:
+        return "sell"
+
+    return None
+
+# =========================
+# Supertrend Calculation
+# =========================
+def calculate_supertrend(df):
+    # ATR calculation for Supertrend
+    atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14)
+    df['atr'] = atr.average_true_range()
+
+    # Supertrend calculation
+    supertrend = SuperTrend(df['high'], df['low'], df['close'], window=10, multiplier=3)
+    df['supertrend'] = supertrend.supertrend()
+    df['supertrend_direction'] = np.where(df['close'] > df['supertrend'], 'green', 'red')
+    return df
+
+# =========================
+# WebSocket Handler (Live 15-Min Data)
+# =========================
+def handle_socket_message(msg):
+    if msg['e'] != 'kline':
+        return
+
+    if msg['k']['x'] is False:  # Only process completed candles
+        return
+
+    # Process the kline (candle) data
+    timestamp = pd.to_datetime(msg['k']['t'], unit='ms')
+    open_price = float(msg['k']['o'])
+    high_price = float(msg['k']['h'])
+    low_price = float(msg['k']['l'])
+    close_price = float(msg['k']['c'])
+    volume = float(msg['k']['v'])
+
+    # Create a DataFrame with this candle
+    new_data = pd.DataFrame({
+        'timestamp': [timestamp],
+        'open': [open_price],
+        'high': [high_price],
+        'low': [low_price],
+        'close': [close_price],
+        'volume': [volume]
+    })
+
+    # Combine new data with existing data (considering you have an existing DataFrame)
+    df = pd.concat([global_df, new_data], ignore_index=True)
+
+    # Add Supertrend calculation
+    df = calculate_supertrend(df)
+
+    # Check for buy or sell signal
+    signal = check_signal(df)
+
+    # Send signal to Telegram if conditions are met
+    if signal == "buy":
+        send_telegram_message("BUY Signal: EMA9 crossed above EMA21 and EMA50, Supertrend is green!")
+    elif signal == "sell":
+        send_telegram_message("SELL Signal: EMA9 crossed below EMA21 and EMA50, Supertrend is green!")
+
+    # Optionally, print the last row for debugging
+    print(f"Processed New Candle: {timestamp} - Signal: {signal}")
+
+# =========================
+# Setup WebSocket for Binance Stream (ETH/USDT 15m)
+# =========================
+def start_socket():
+    # Global dataframe to store the data
+    global global_df
+    global_df = pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+    # Setup Binance WebSocket Manager (No API Key Needed for Public Data)
+    socket = BinanceSocketManager(Client(None, None))  # No API Key, just public data
+    socket = socket.kline_socket('ETHUSDT', KLINE_INTERVAL_15MINUTE)
+
+    # Register the handler function
+    socket.start()
+
+    # Run indefinitely to keep the socket alive
+    socket.run_forever()
+
+if __name__ == "__main__":
+    start_socket()
