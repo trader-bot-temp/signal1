@@ -1,0 +1,177 @@
+import os
+import time
+import requests
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+
+# =========================
+# TELEGRAM CONFIG
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    print("❌ Missing Telegram credentials in Railway Variables")
+    exit()
+
+def send(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+        r = requests.get(
+            url,
+            params={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=10
+        )
+
+        # Debug response (IMPORTANT for debugging)
+        print("Telegram response:", r.json())
+
+    except Exception as e:
+        print("Telegram error:", e)
+
+# =========================
+# FETCH DATA (CoinGecko)
+# =========================
+def fetch_data():
+    url = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart?vs_currency=usd&days=1"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+
+        prices = data.get("prices", [])
+        if not prices:
+            return None
+
+        df = pd.DataFrame(prices, columns=["time", "price"])
+        df["time"] = pd.to_datetime(df["time"], unit="ms")
+
+        return df
+
+    except Exception as e:
+        print("fetch error:", e)
+        return None
+
+# =========================
+# BUILD 15-MIN CANDLES
+# =========================
+def build_candles(df):
+    try:
+        df = df.set_index("time")
+
+        ohlc = df["price"].resample("15min").ohlc()
+
+        # remove incomplete candles
+        ohlc = ohlc.dropna()
+
+        return ohlc
+
+    except Exception as e:
+        print("candle error:", e)
+        return None
+
+# =========================
+# INDICATORS
+# =========================
+def add_indicators(df):
+    try:
+        if df is None or len(df) < 50:
+            return None
+
+        df["ema9"] = ta.ema(df["close"], 9)
+        df["ema21"] = ta.ema(df["close"], 21)
+        df["ema50"] = ta.ema(df["close"], 50)
+
+        return df.dropna()
+
+    except Exception as e:
+        print("indicator error:", e)
+        return None
+
+# =========================
+# SIGNAL LOGIC
+# =========================
+def get_signal(df):
+    try:
+        if df is None or len(df) < 2:
+            return None
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # BUY
+        if last["ema9"] > last["ema21"] > last["ema50"] and prev["ema9"] < prev["ema21"]:
+            return "buy"
+
+        # SELL
+        if last["ema9"] < last["ema21"] < last["ema50"] and prev["ema9"] > prev["ema21"]:
+            return "sell"
+
+        return None
+
+    except Exception as e:
+        print("signal error:", e)
+        return None
+
+# =========================
+# MAIN LOOP
+# =========================
+def run():
+    last_candle_time = None
+        # ✅ SEND TEST MESSAGE ONLY ONCE WHEN BOT STARTS
+    send("✅ Bot is live and working")
+
+    while True:
+        try:
+            raw = fetch_data()
+            if raw is None:
+                print("no data...")
+                time.sleep(60)
+                continue
+
+            candles = build_candles(raw)
+            if candles is None or len(candles) < 50:
+                print("waiting candles...")
+                time.sleep(60)
+                continue
+
+            df = add_indicators(candles)
+            if df is None:
+                time.sleep(60)
+                continue
+
+            signal = get_signal(df)
+            current_time = df.index[-1]
+
+            # prevent duplicate alerts
+            if signal and current_time != last_candle_time:
+                if signal == "buy":
+                    send(f"📈 BUY Signal (ETH 15m)\nTime: {current_time}")
+                else:
+                    send(f"📉 SELL Signal (ETH 15m)\nTime: {current_time}")
+
+                last_candle_time = current_time
+
+            # clean log output
+            last = df.iloc[-1]
+            print(
+                f"{current_time} | Close {round(last['close'],2)} | "
+                f"EMA9 {round(last['ema9'],2)} | EMA21 {round(last['ema21'],2)} | Signal {signal}"
+            )
+
+        except Exception as e:
+            print("loop error:", e)
+
+        time.sleep(60)
+
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    run()
